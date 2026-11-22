@@ -1,17 +1,25 @@
+<p align="right"><strong>English</strong> · <a href="README.zh-CN.md">简体中文</a></p>
+
 # ExplorerRecall
 
-Fuck Microsoft, 防止 explorer 意外崩溃导致你丢失工作，特别是对于我这种容不得意外的强迫症。
+Fuck Microsoft. I wrote this because an Explorer crash shouldn't cost me the folders I was working in.
 
-保存并恢复 Windows 文件资源管理器打开的文件夹，也可搜索文件夹历史和任务栏程序记录。原生 C++，支持中文和 English。
+**[Download for Windows x64](https://github.com/Felix3322/ExplorerRecall/releases/latest/download/ExplorerRecall.exe)**
 
-**[下载 Windows x64 版](https://github.com/Felix3322/ExplorerRecall/releases/latest/download/ExplorerRecall.exe)**
+In **Open folders**, click **Save session** before closing your windows. In **Saved sessions**, click **Restore session** to reopen the missing folders. For automatic snapshots, leave **Record while running** checked. If you have no snapshot, **Folder history** shows folders Windows remembers visiting.
 
-![ExplorerRecall：已打开的文件夹，本机路径已遮盖](docs/interface.png)
+![Real folder history filtered to Windows system folders; black bars cover private text.](docs/history-en.png)
 
-在 **当前打开** 中保存会话，稍后到 **已保存的会话** 恢复。已打开的路径会跳过。文件夹历史是访问痕迹，不能精确重建过去某一刻的窗口组合。
+### Windows APIs
 
-表格默认每页 128 行，右下角可选择页码或全部；搜索和排序覆盖全部记录。[Windows 会话记录来源](docs/recovery-signals.md)
+| View | Where the data comes from |
+|---|---|
+| Open folders | `IShellWindows::Item` and `IWebBrowser2::get_Document` enumerate Shell views. `FolderItem::get_Path` reads the folder path. |
+| Folder history | `RegEnumKeyExW` and `RegGetValueW` read ShellBags. `SHGetPathFromIDListEx` turns the stored identifiers into paths. The timestamp is the registry key's last update. |
+| Taskbar apps | `RegEnumValueW` reads Explorer's FeatureUsage counters and UserAssist records. `EnumWindows`, `GetWindowThreadProcessId` and `QueryFullProcessImageNameW` identify current windows. `IApplicationDocumentLists::GetList` retrieves an app's recent Jump List items. |
 
-**构建**：安装 Visual Studio 2022 C++ Build Tools 和 Windows SDK，运行 build.cmd，产物为 bin/ExplorerRecall.exe。
+![File Explorer's taskbar activity on the same PC.](docs/taskbar-en.png)
+
+**Build:** Run `build.cmd` with Visual Studio 2022 C++ Build Tools and the Windows SDK installed. The executable is `bin\ExplorerRecall.exe`.
 
 [GPL-3.0-only](LICENSE)
