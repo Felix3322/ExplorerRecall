@@ -1,5 +1,7 @@
 # ExplorerRecall
 
+Fuck Microsoft, 防止 explorer 意外崩溃导致你丢失工作，特别是对于我这种容不得意外的强迫症。
+
 保存并恢复 Windows 文件资源管理器打开的文件夹，也可搜索文件夹历史和任务栏程序记录。原生 C++，支持中文和 English。
 
 **[下载 Windows x64 版](https://github.com/Felix3322/ExplorerRecall/releases/latest/download/ExplorerRecall.exe)**
