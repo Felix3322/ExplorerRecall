@@ -17,7 +17,7 @@
 #pragma comment(linker,"/manifestdependency:\"type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 namespace {
 constexpr UINT deliver=WM_APP+7;
-enum Id {Tabs=100,Search,Filter,List,Save,Restore,Whole,Refresh,Auto,Sessions,Name,Dates,Info,Foot,Title,AppFilter,Details,Language};
+enum Id {Tabs=100,Search,Filter,List,Save,Restore,Whole,Refresh,Auto,Sessions,Name,Dates,Info,Foot,Title,AppFilter,Details,Language,Page};
 struct SortOrder {int column;bool descending;};
 SortOrder orders[]={{1,true},{3,false},{3,false},{-1,false}};
 unsigned languageGeneration=0;
@@ -27,7 +27,10 @@ const COLORREF background=RGB(255,255,255),ink=RGB(30,49,67),muted=RGB(69,92,111
 HBRUSH canvas=nullptr;HIMAGELIST heights=nullptr;bool contrast=false;
 HWND mainWin;HFONT font,titleFont;bool reading=false,readingHistory=false,restoring=false,valid=false,everRead=false,initDb=false,writing=false;
 bool pendingSave=false;unsigned probeGeneration=0;Str pendingName; Open live;Library library;
-std::vector<Row> visits,sessionRows,liveRows;std::vector<size_t> matches;
+std::vector<Row> visits,sessionRows,liveRows;std::vector<size_t> matches,allMatches;
+constexpr int pageSize=128;
+int pageIndex=0; // -1 is the explicit all-rows view.
+
 Str notice,liveError,dbError,historyError;
 std::mutex queueMutex;std::condition_variable queueReady;std::deque<std::function<void()>> dbQueue;
 bool shuttingDown=false;std::atomic<int> dbTasks{0};
@@ -59,42 +62,31 @@ struct DisplayRow {
 std::vector<DisplayRow> display;
 bool dataDirty=true,stateDirty=true;
 unsigned long long displayRevision=1;
-void prepareRows(){
-    bool app=mode()==3;const auto& src=source();
-    const size_t count=app?apps.rows.size():src.size();
-    if(dataDirty || display.size()!=count){
-        display.clear();display.resize(count);
-        for(size_t i=0;i<count;i++){
-            auto& row=display[i];
-            if(app){
-                const auto& r=apps.rows[i];row.time=r.time;row.text[2]=r.name;
-                row.text[3]=Str(sourceName(r.source))+L"  ·  "+r.summary;
-            }else{
-                const auto& r=src[i];row.time=r.time;row.text[3]=r.path;auto n=r.path.find_last_of(L'\\');
-                row.text[2]=n+1<r.path.size()?r.path.substr(n+1):r.path;
-            }
-            row.text[1]=timestamp(row.time);
-        }
-        stateDirty=true;dataDirty=false;
-    }
-    if(!stateDirty)return;
-    ++displayRevision;
-    for(size_t i=0;i<count;i++){
-        auto& r=display[i];
-        r.state=app?apps.rows[i].state:!valid?2:live.paths.count(src[i].path)?0:live.partial?2:1;
-        r.text[0]=tr(r.state==0?Text::Open:r.state==1?(app?Text::NoWindow:Text::Closed):Text::Unknown);
-    }
-    stateDirty=false;
-}
+// One running job and one replaceable pending job per lane. No HWND access in the workers.
+class LatestWork {
+    std::mutex mutex;std::condition_variable ready;std::function<void()> pending;
+    bool stopping=false;std::thread thread;
+public:
+    void start(){thread=std::thread([this]{for(;;){std::function<void()> run;
+        {std::unique_lock lock(mutex);ready.wait(lock,[&]{return stopping||bool(pending);});
+         if(stopping)return;run=std::move(pending);}run();}});}
+    void submit(std::function<void()> job){{std::lock_guard lock(mutex);pending=std::move(job);}ready.notify_one();}
+    void stop(){{std::lock_guard lock(mutex);stopping=true;pending={};}ready.notify_one();if(thread.joinable())thread.join();}
+};
+LatestWork tableWork,paintWork;
+struct TableInput {std::vector<Row> folders;std::vector<AppRecord> programs;};
+std::shared_ptr<const TableInput> currentInput;
+std::shared_ptr<const Open> currentOpen;
+uint64_t tableVersion=0;
 const Str& cell(size_t index,int col){
     static const Str empty;
     return index<display.size()&&col>=0&&col<4?display[index].text[col]:empty;
 }
 void status(){
-    Str s=std::to_wstring(matches.size())+tr(Text::Rows);
+    Str s=std::to_wstring(allMatches.size())+tr(Text::Rows);
     s+=valid ? tr(Text::OpenCount)+std::to_wstring(live.paths.size())+tr(Text::Folders)+(live.partial?tr(Text::PartialPaths):L"") : everRead? tr(Text::Unverified):tr(Text::Detecting);
     for(auto p:{&liveError,&dbError,&historyError,&notice})if(!p->empty())s+=L"    "+*p;
-    if(mode()==3)s=std::to_wstring(matches.size())+tr(Text::AppRows)+(readingApps?tr(Text::LoadingInline):L"")+L"    "+appsError;
+    if(mode()==3)s=std::to_wstring(allMatches.size())+tr(Text::AppRows)+(readingApps?tr(Text::LoadingInline):L"")+L"    "+appsError;
     static Str lastFooter;if(lastFooter!=s){SetWindowTextW(ctl(Foot),s.c_str());lastFooter=s;}
     EnableWindow(ctl(Details),mode()==3 && ListView_GetSelectedCount(ctl(List))==1);
     EnableWindow(ctl(Restore),mode()!=3 && !restoring && ListView_GetSelectedCount(ctl(List))>0);
@@ -113,39 +105,23 @@ void sortHeader(){
         if(next!=item.fmt){item.fmt=next;Header_SetItem(header,col,&item);}
     }
 }
-void sortRows(std::vector<size_t>& indices){
-    const auto order=orders[mode()];if(order.column<0)return;
-    const wchar_t* locale=englishUI?L"en-US":L"zh-CN";
-    std::stable_sort(indices.begin(),indices.end(),[&](size_t ia,size_t ib){
-        const auto& a=display[ia];const auto& b=display[ib];
-        if(order.column==1 && (a.time==0)!=(b.time==0))return b.time==0;
-        if(order.column==1)return order.descending?a.time>b.time:a.time<b.time;
-        if(order.column==0)return order.descending?a.state>b.state:a.state<b.state;
-        int cmp=CompareStringEx(locale,NORM_IGNORECASE|SORT_DIGITSASNUMBERS,a.text[order.column].c_str(),-1,b.text[order.column].c_str(),-1,nullptr,nullptr,0);
-        return cmp==(order.descending?CSTR_GREATER_THAN:CSTR_LESS_THAN);
-    });
-}
-void rebuild(bool keep=false){
-    prepareRows();
-    const auto& src=source();auto list=ctl(List);
-    int top=keep?ListView_GetTopIndex(list):0;
-    Str q=getText(Search);int f=sel(Filter),d=sel(Dates);
-    const Stamp day=86400LL*10000000;
-    Stamp cutoff=0;
-    if(mode()==0 && d>0){SYSTEMTIME s{},u{};GetLocalTime(&s);s.wHour=s.wMinute=s.wSecond=s.wMilliseconds=0;
-        FILETIME ft{};TzSpecificLocalTimeToSystemTime(nullptr,&s,&u);SystemTimeToFileTime(&u,&ft);
-        cutoff=((Stamp(ft.dwHighDateTime)<<32)|ft.dwLowDateTime)-(d==1?0:d==2?6:29)*day;}
-    std::vector<size_t> next;next.reserve(mode()==3?apps.rows.size():src.size());
-    if(mode()==3){
-        int origin=sel(AppFilter);
-        for(size_t i=0;i<apps.rows.size();++i){const auto& r=apps.rows[i];
-            if(origin>0&&origin!=int(r.source))continue;
-            if(f==1 && r.state!=0)continue;if(f==2 && r.state==0)continue;
-            if(q.empty()||StrStrIW(r.search.c_str(),q.c_str()))next.push_back(i);}
-    }else for(size_t i=0;i<src.size();i++){const auto& row=src[i];if(row.time<cutoff||(!q.empty()&&!StrStrIW(row.path.c_str(),q.c_str())))continue;
-        if(f>0 && (!valid || (display[i].state==0)!=(f==1)))continue;
-        next.push_back(i);}
-    sortRows(next);
+void showPage(bool keep){
+    HWND list=ctl(List);int top=ListView_GetTopIndex(list);
+    int pages=int((allMatches.size()+pageSize-1)/pageSize);
+    if(pageIndex>=pages)pageIndex=std::max(0,pages-1);
+    static size_t prevCount=SIZE_MAX;static bool prevEn=false;
+    const bool en=englishUI.load();HWND page=ctl(Page);
+    if(prevCount!=allMatches.size()||prevEn!=en){
+        prevCount=allMatches.size();prevEn=en;SendMessageW(page,CB_RESETCONTENT,0,0);
+        for(int n=0;n<pages;n++){Str label=std::to_wstring(n*pageSize+1)+L" – "+std::to_wstring(std::min(allMatches.size(),size_t(n+1)*pageSize))+L" / "+std::to_wstring(allMatches.size());
+            SendMessageW(page,CB_ADDSTRING,0,(LPARAM)label.c_str());}
+        SendMessageW(page,CB_ADDSTRING,0,(LPARAM)(en?L"All rows":L"全部行"));
+    }
+    ShowWindow(page,pages>1?SW_SHOW:SW_HIDE);
+    SendMessageW(page,CB_SETCURSEL,pageIndex<0?pages:pageIndex,0);
+    size_t begin=pageIndex<0?0:size_t(pageIndex)*pageSize;
+    size_t end=pageIndex<0?allMatches.size():std::min(begin+pageSize,allMatches.size());
+    std::vector<size_t> next(allMatches.begin()+begin,allMatches.begin()+end);
     std::set<size_t> selected;
     if(keep && next!=matches){
         for(int i=ListView_GetNextItem(list,-1,LVNI_SELECTED);i>=0;i=ListView_GetNextItem(list,i,LVNI_SELECTED))
@@ -161,6 +137,51 @@ void rebuild(bool keep=false){
     if(!keep&&!matches.empty())ListView_EnsureVisible(list,0,FALSE);
     if(keep && top>=int(matches.size())&&!matches.empty())ListView_EnsureVisible(list,int(matches.size()-1),FALSE);
     SendMessageW(list,WM_SETREDRAW,TRUE,0);InvalidateRect(list,nullptr,FALSE);status();
+ }
+void rebuild(bool keep=false){
+    if(!keep&&pageIndex>=0)pageIndex=0;
+    const int page=mode();bool app=page==3;HWND list=ctl(List);
+    if(dataDirty||!currentInput){
+        auto input=std::make_shared<TableInput>();
+        if(app)input->programs=apps.rows;else input->folders=source();
+        currentInput=std::move(input);dataDirty=false;keep=false;
+        // Old indices must never be used against the replacement source.
+        allMatches.clear();matches.clear();display.clear();ListView_SetItemCountEx(list,0,LVSICF_NOSCROLL);++displayRevision;
+    }
+    if(stateDirty||!currentOpen){currentOpen=std::make_shared<Open>(live);stateDirty=false;}
+    const auto query=getText(Search);const int filter=sel(Filter),date=sel(Dates),origin=sel(AppFilter);
+    const auto order=orders[page];const auto version=++tableVersion;
+    const bool en=englishUI.load(),known=valid;
+    Stamp cutoff=0;
+    if(page==0&&date>0){SYSTEMTIME local{},utc{};GetLocalTime(&local);local.wHour=local.wMinute=local.wSecond=local.wMilliseconds=0;
+        FILETIME ft{};TzSpecificLocalTimeToSystemTime(nullptr,&local,&utc);SystemTimeToFileTime(&utc,&ft);
+        cutoff=((Stamp(ft.dwHighDateTime)<<32)|ft.dwLowDateTime)-(date==1?0:date==2?6:29)*864000000000LL;}
+    tableWork.submit([=,input=currentInput,state=currentOpen]{
+        const size_t n=app?input->programs.size():input->folders.size();
+        std::vector<DisplayRow> rows(n);std::vector<size_t> next;next.reserve(n);
+        for(size_t i=0;i<n;i++){
+            auto& r=rows[i];const Str* search;
+            if(app){const auto& a=input->programs[i];r.time=a.time;r.text[2]=a.name;r.text[3]=Str(sourceName(a.source))+L"  ·  "+a.summary;
+                r.state=a.state;search=&a.search;if(origin>0&&origin!=int(a.source))continue;}
+            else{const auto& f=input->folders[i];r.time=f.time;r.text[3]=f.path;auto split=f.path.find_last_of(wchar_t(92));
+                r.text[2]=split+1<f.path.size()?f.path.substr(split+1):f.path;r.state=!known?2:state->paths.count(f.path)?0:state->partial?2:1;search=&f.path;}
+            if(r.time<cutoff||(!query.empty()&&!StrStrIW(search->c_str(),query.c_str())))continue;
+            if(filter>0&&((!app&&!known)||((r.state==0)!=(filter==1))))continue;
+            r.text[1]=timestamp(r.time);r.text[0]=tr(r.state==0?Text::Open:r.state==1?(app?Text::NoWindow:Text::Closed):Text::Unknown);
+            next.push_back(i);
+        }
+        if(order.column>=0)std::stable_sort(next.begin(),next.end(),[&](size_t i,size_t j){
+            const auto& a=rows[i];const auto& b=rows[j];int c=order.column;
+            if(c==1&&(a.time==0)!=(b.time==0))return b.time==0;
+            if(c<2){auto x=c?a.time:a.state,y=c?b.time:b.state;return order.descending?x>y:x<y;}
+            return CompareStringEx(en?L"en-US":L"zh-CN",NORM_IGNORECASE|SORT_DIGITSASNUMBERS,a.text[c].c_str(),-1,b.text[c].c_str(),-1,nullptr,nullptr,0)==(order.descending?CSTR_GREATER_THAN:CSTR_LESS_THAN);
+        });
+        post([version,list,keep,rows=std::move(rows),next=std::move(next)]()mutable{
+            if(version!=tableVersion||!IsWindow(list))return;
+            display.swap(rows);++displayRevision;
+            allMatches.swap(next);showPage(keep);
+        });
+    });
 }
 void pickSession(){
     sessionRows.clear();int i=sel(Sessions);if(i>=0 && i<int(library.snaps.size())){
@@ -313,7 +334,7 @@ void layout(){
     move(List,left,143,right-left,h-239);
     ListView_SetColumnWidth(ctl(List),3,px(std::max(190,right-left-475-22)));
     move(Restore,left,h-80,119,32);move(Whole,left+125,h-80,128,32);move(Details,left,h-80,134,32);
-    move(Name,right-318,h-79,182,29);move(Save,right-130,h-80,130,32);move(Foot,left,h-36,right-left,24);
+    move(Name,right-318,h-79,182,29);move(Save,right-130,h-80,130,32);move(Foot,left,h-36,right-left-166,24);move(Page,right-156,h-41,156,245);
 }
 void viewMode(){
     const Text pages[]={Text::History,Text::Sessions,Text::Current,Text::Taskbar};SetWindowTextW(ctl(Title),tr(pages[mode()]));
@@ -366,7 +387,7 @@ void refreshLanguage(){
     InvalidateRect(ctl(Tabs),nullptr,TRUE);
 }
 // Keep at most one outstanding wheel/track position during a burst of input.
-struct ScrollInput {int target=-1,remainder=0;bool queued=false;};
+struct ScrollInput {int target=-1,remainder=0;bool queued=false,drag=false;int origin=0,travel=0,maxTop=0;};
 constexpr UINT applyScroll=WM_APP+81;
 LRESULT CALLBACK listInput(HWND list,UINT msg,WPARAM w,LPARAM l,UINT_PTR id,DWORD_PTR ref){
     auto& input=*reinterpret_cast<ScrollInput*>(ref);
@@ -376,6 +397,25 @@ LRESULT CALLBACK listInput(HWND list,UINT msg,WPARAM w,LPARAM l,UINT_PTR id,DWOR
         input.target=std::clamp(position,si.nMin,std::max(si.nMin,si.nMax-int(si.nPage)+1));
         if(!input.queued){input.queued=PostMessageW(list,applyScroll,0,0)!=FALSE;}
     };
+    // Native nonclient thumb tracking enters a nested loop. Track our own vertical thumb
+    // with mouse capture so queued work and ordinary paints use the normal UI message loop.
+    if(msg==WM_NCLBUTTONDOWN && w==HTVSCROLL){
+        SCROLLBARINFO bar{sizeof(bar)};SCROLLINFO range{sizeof(range),SIF_RANGE|SIF_PAGE};
+        const int y=GET_Y_LPARAM(l);
+        if(GetScrollBarInfo(list,OBJID_VSCROLL,&bar)&&GetScrollInfo(list,SB_VERT,&range)&&
+           y>=bar.rcScrollBar.top+bar.xyThumbTop&&y<bar.rcScrollBar.top+bar.xyThumbBottom){
+            input.travel=bar.rcScrollBar.bottom-bar.rcScrollBar.top-2*bar.dxyLineButton-(bar.xyThumbBottom-bar.xyThumbTop);
+            input.origin=bar.rcScrollBar.top+bar.dxyLineButton+y-(bar.rcScrollBar.top+bar.xyThumbTop);
+            input.maxTop=std::max(0,range.nMax-int(range.nPage)+1);
+            if(input.travel>0){SetCapture(list);input.drag=GetCapture()==list;if(input.drag)return 0;}
+        }
+    }
+    if(input.drag && (msg==WM_MOUSEMOVE||msg==WM_LBUTTONUP)){
+        POINT point{GET_X_LPARAM(l),GET_Y_LPARAM(l)};ClientToScreen(list,&point);
+        schedule(MulDiv(std::clamp(int(point.y)-input.origin,0,input.travel),input.maxTop,input.travel));
+        if(msg==WM_LBUTTONUP){input.drag=false;ReleaseCapture();}return 0;
+    }
+    if(msg==WM_CAPTURECHANGED||msg==WM_CANCELMODE)input.drag=false;
     if(msg==WM_MOUSEWHEEL && !(GET_KEYSTATE_WPARAM(w)&(MK_SHIFT|MK_CONTROL))){
         UINT lines=3;SystemParametersInfoW(SPI_GETWHEELSCROLLLINES,0,&lines,0);
         if(lines==WHEEL_PAGESCROLL)lines=std::max(1,ListView_GetCountPerPage(list));
@@ -391,7 +431,13 @@ LRESULT CALLBACK listInput(HWND list,UINT msg,WPARAM w,LPARAM l,UINT_PTR id,DWOR
     if(msg==applyScroll){
         int pos=input.target;input.target=-1;input.queued=false;RECT item{};
         if(pos>=0&&ListView_GetItemRect(list,0,&item,LVIR_BOUNDS)){
-            auto diff=pos-ListView_GetTopIndex(list);if(diff)ListView_Scroll(list,0,diff*(item.bottom-item.top));
+            auto diff=pos-ListView_GetTopIndex(list);
+            if(diff){
+                SendMessageW(list,WM_SETREDRAW,FALSE,0);
+                ListView_Scroll(list,0,diff*(item.bottom-item.top));
+                SendMessageW(list,WM_SETREDRAW,TRUE,0);
+                RedrawWindow(list,nullptr,nullptr,RDW_INVALIDATE|RDW_FRAME);
+            }
         }
         return 0;
     }
@@ -423,7 +469,7 @@ void initUI(){
     add(Details,L"BUTTON",tr(Text::Details),WS_TABSTOP);
     auto name=add(Name,L"EDIT",L"",ES_AUTOHSCROLL|WS_TABSTOP,WS_EX_CLIENTEDGE);SendMessageW(name,EM_LIMITTEXT,100,0);
     SendMessageW(name,EM_SETCUEBANNER,TRUE,reinterpret_cast<LPARAM>(tr(Text::NamePrompt)));add(Save,L"BUTTON",tr(Text::SaveSession),WS_TABSTOP);add(Foot,L"STATIC",L"",SS_LEFT|SS_ENDELLIPSIS);
-    viewMode();layout();
+    makeCombo(Page,{});viewMode();layout();
     enqueue([]{try{auto lib=readLibrary();post([lib=std::move(lib)]()mutable{
         auto on=lib.record;Button_SetCheck(ctl(Auto),on?BST_CHECKED:BST_UNCHECKED);applyLib(std::move(lib),false);
         if(on && valid && !live.paths.empty())persist(live,tr(Text::AutoTitle),false);
@@ -431,85 +477,83 @@ void initUI(){
     readHistory();poll();SetTimer(mainWin,1,5000,nullptr);
 }
 void fill(HDC dc,const RECT& rect,COLORREF color){SetDCBrushColor(dc,color);FillRect(dc,&rect,(HBRUSH)GetStockObject(DC_BRUSH));}
-// Cache only a few viewports. Scrolling reuses overlapping rows; sorting reuses the
-// same source records. A new data generation, column geometry or size invalidates tiles.
-struct RowTiles {
-    HDC dc=nullptr; HBITMAP bitmap=nullptr; HGDIOBJ original=nullptr;
-    int width=0,height=0,capacity=0,cursor=0,pad=0,bar=0;
-    unsigned long long revision=0;
-    RECT columns[4]{};
-    std::vector<size_t> owners;
-    std::vector<UINT> styles;
-    std::map<size_t,int> slots;
-    void release(){
-        if(dc&&original)SelectObject(dc,original);
-        if(bitmap)DeleteObject(bitmap);
-        if(dc)DeleteDC(dc);
-        dc=nullptr;bitmap=nullptr;original=nullptr;
-    }
-    ~RowTiles(){release();}
-    void configure(HWND list,HDC dest){
-        RECT client{},row{},cols[4]{};GetClientRect(list,&client);
-        if(!ListView_GetItemRect(list,0,&row,LVIR_BOUNDS))return;
-        int w=client.right,h=row.bottom-row.top;
-        if(w<=0||h<=0)return;
-        auto header=ListView_GetHeader(list);
-        for(int c=0;c<4;c++){Header_GetItemRect(header,c,cols+c);MapWindowPoints(header,list,(POINT*)(cols+c),2);}
-        int cap=int(std::min<long long>(std::max(16,(int(client.bottom)/h+2)*4),16LL*1024*1024/(4LL*w*h)));
-        if(!dc||width!=w||height!=h||capacity!=cap){
-            release();width=w;height=h;capacity=cap;revision=0;
-            if(cap<1)return;
-            dc=CreateCompatibleDC(dest);bitmap=CreateCompatibleBitmap(dest,w,h*cap);
-            if(!dc||!bitmap){release();return;}
-            original=SelectObject(dc,bitmap);SelectObject(dc,font);SetBkMode(dc,TRANSPARENT);
-            owners.assign(cap,SIZE_MAX);styles.assign(cap,0);pad=px(7);bar=px(3);
-        }
-        if(revision!=displayRevision||memcmp(columns,cols,sizeof(cols))!=0){
-            memcpy(columns,cols,sizeof(cols));revision=displayRevision;cursor=0;slots.clear();
-            std::fill(owners.begin(),owners.end(),SIZE_MAX);
-        }
-    }
-    void paint(int i,const DisplayRow& data,UINT bits){
-        const COLORREF base[]={RGB(232,246,238),RGB(244,246,249),RGB(255,245,221)};
-        const COLORREF active[]={RGB(190,229,205),RGB(217,227,239),RGB(246,223,174)};
-        const COLORREF labels[]={RGB(19,103,61),RGB(75,89,107),RGB(126,82,11)};
-        const bool selected=(bits&LVIS_SELECTED)!=0;
-        RECT r{0,i*height,width,(i+1)*height};fill(dc,r,selected?active[data.state]:base[data.state]);
-        RECT line=r;line.top=line.bottom-1;fill(dc,line,RGB(255,255,255));
-        if(selected){RECT strip=r;strip.right=bar;fill(dc,strip,accent);}
-        for(int c=0;c<4;c++){
-            RECT box{columns[c].left+pad,r.top,columns[c].right-pad,r.bottom};
-            if(box.right<=0||box.left>=width||box.right<=box.left)continue;
-            SetTextColor(dc,c==0?labels[data.state]:c==1?muted:ink);
-            DrawTextW(dc,data.text[c].c_str(),int(data.text[c].size()),&box,DT_SINGLELINE|DT_VCENTER|DT_END_ELLIPSIS|DT_NOPREFIX);
-        }
-        if(bits&LVIS_FOCUSED){InflateRect(&r,-2,-2);DrawFocusRect(dc,&r);}
-    }
-    int tile(size_t key,UINT bits){
-        auto it=slots.find(key);int slot;
-        if(it!=slots.end()){slot=it->second;if(styles[slot]==bits)return slot;}
-        else{
-            slot=cursor++%capacity;slots.erase(owners[slot]);owners[slot]=key;slots[key]=slot;
-        }
-        styles[slot]=bits;paint(slot,display[key],bits);return slot;
-    }
+struct PaintKey {
+    uint64_t revision=0;int width=0,height=0,pad=0,bar=0;
+    std::array<int,8> edges{};
+    bool operator==(const PaintKey& r)const{return revision==r.revision&&width==r.width&&height==r.height&&edges==r.edges&&pad==r.pad&&bar==r.bar;}
 };
-LRESULT drawList(NMLVCUSTOMDRAW* d){
-    static RowTiles tiles;
-    if(contrast)return CDRF_DODEFAULT;
-    HWND list=d->nmcd.hdr.hwndFrom;HDC dest=d->nmcd.hdc;
-    if(d->nmcd.dwDrawStage==CDDS_PREPAINT){
-        tiles.configure(list,dest);return tiles.dc?CDRF_NOTIFYITEMDRAW:CDRF_DODEFAULT;
+using TileId=std::pair<size_t,UINT>;
+struct Frame {
+    PaintKey key;std::vector<TileId> ids;std::vector<DWORD> pixels;
+};
+std::deque<std::shared_ptr<Frame>> frames;
+PaintKey requested;std::vector<TileId> requestedRows;bool systemPaint=false;
+// The worker owns its DC, DIB, font and immutable text snapshot. It never messages a window.
+std::shared_ptr<Frame> raster(PaintKey key,std::vector<TileId> ids,const std::vector<DisplayRow>& rows,LOGFONTW lf){
+    const size_t total=size_t(key.width)*key.height*ids.size();
+    if(!total||total>8*1024*1024)return {};
+    auto out=std::make_shared<Frame>();out->key=key;out->ids=std::move(ids);out->pixels.resize(total);
+    HDC dc=CreateCompatibleDC(nullptr);if(!dc)return {};
+    BITMAPINFO bi{};bi.bmiHeader={sizeof(BITMAPINFOHEADER),key.width,-int(key.height*rows.size()),1,32,BI_RGB};
+    void* bits=nullptr;auto bmp=CreateDIBSection(dc,&bi,DIB_RGB_COLORS,&bits,nullptr,0);
+    if(!bmp){DeleteDC(dc);return {};}
+    auto old=SelectObject(dc,bmp);HFONT localFont=CreateFontIndirectW(&lf);auto prior=SelectObject(dc,localFont);SetBkMode(dc,TRANSPARENT);
+    const COLORREF base[]={RGB(232,246,238),RGB(244,246,249),RGB(255,245,221)};
+    const COLORREF selected[]={RGB(190,229,205),RGB(217,227,239),RGB(246,223,174)};
+    const COLORREF labels[]={RGB(19,103,61),RGB(75,89,107),RGB(126,82,11)};
+    for(size_t i=0;i<rows.size();++i){
+        auto& row=rows[i];auto flags=out->ids[i].second;RECT r{0,int(i)*key.height,key.width,(int(i)+1)*key.height};
+        fill(dc,r,(flags&LVIS_SELECTED)?selected[row.state]:base[row.state]);RECT line=r;line.top=line.bottom-1;fill(dc,line,RGB(255,255,255));
+        if(flags&LVIS_SELECTED){auto bar=r;bar.right=key.bar;fill(dc,bar,accent);}
+        for(int c=0;c<4;c++){RECT box{key.edges[2*c]+key.pad,r.top,key.edges[2*c+1]-key.pad,r.bottom};
+            SetTextColor(dc,c==0?labels[row.state]:c==1?muted:ink);
+            if(box.left<box.right)DrawTextW(dc,row.text[c].c_str(),int(row.text[c].size()),&box,DT_SINGLELINE|DT_VCENTER|DT_END_ELLIPSIS|DT_NOPREFIX);}
+        if(flags&LVIS_FOCUSED){InflateRect(&r,-2,-2);DrawFocusRect(dc,&r);}
     }
-    auto i=size_t(d->nmcd.dwItemSpec);
-    if(d->nmcd.dwDrawStage!=CDDS_ITEMPREPAINT||!tiles.dc||i>=matches.size()||matches[i]>=display.size())return CDRF_DODEFAULT;
-    UINT bits=ListView_GetItemState(list,int(i),LVIS_SELECTED|LVIS_FOCUSED);
-    if(GetFocus()!=list)bits&=~LVIS_FOCUSED;
-    RECT r{};ListView_GetItemRect(list,int(i),&r,LVIR_BOUNDS);
-    if(!RectVisible(dest,&r))return CDRF_SKIPDEFAULT;
-    int slot=tiles.tile(matches[i],bits);
-    BitBlt(dest,0,r.top,tiles.width,tiles.height,tiles.dc,0,slot*tiles.height,SRCCOPY);
-    return CDRF_SKIPDEFAULT;
+    GdiFlush();memcpy(out->pixels.data(),bits,total*4);
+    SelectObject(dc,prior);SelectObject(dc,old);DeleteObject(localFont);DeleteObject(bmp);DeleteDC(dc);return out;
+}
+UINT rowFlags(HWND list,int i){
+    UINT flags=ListView_GetItemState(list,i,LVIS_SELECTED|LVIS_FOCUSED);
+    return GetFocus()==list?flags:flags&~LVIS_FOCUSED;
+}
+void requestFrame(HWND list){
+    if(matches.empty())return;
+    PaintKey k;k.revision=displayRevision;k.pad=px(7);k.bar=px(3);RECT r{};GetClientRect(list,&r);k.width=r.right;
+    int top=ListView_GetTopIndex(list);if(!ListView_GetItemRect(list,top,&r,LVIR_BOUNDS))return;
+    k.height=r.bottom-r.top;if(k.width<=0||k.height<=0)return;
+    HWND header=ListView_GetHeader(list);for(int i=0;i<4;++i){Header_GetItemRect(header,i,&r);MapWindowPoints(header,list,(POINT*)&r,2);k.edges[2*i]=r.left;k.edges[2*i+1]=r.right;}
+    std::vector<TileId> ids;int end=std::min<int>(int(matches.size()),top+ListView_GetCountPerPage(list)+3);
+    for(int i=top;i<end;++i)ids.emplace_back(matches[i],rowFlags(list,i));
+    if(k==requested&&ids==requestedRows)return;
+    requested=k;requestedRows=ids;
+    std::vector<DisplayRow> rows;rows.reserve(ids.size());for(auto& id:ids)rows.push_back(display[id.first]);
+    LOGFONTW lf{};GetObjectW(font,sizeof(lf),&lf);
+    paintWork.submit([list,k,lf,ids=std::move(ids),rows=std::move(rows)]()mutable{
+        std::shared_ptr<Frame> frame;try{frame=raster(k,std::move(ids),rows,lf);}catch(const std::bad_alloc&){}
+        post([list,k,frame=std::move(frame)]{
+            if(!IsWindow(list)||!(k==requested))return;
+            if(frame){frames.push_front(frame);while(frames.size()>2)frames.pop_back();}
+            else systemPaint=true;
+            InvalidateRect(list,nullptr,FALSE);
+        });
+    });
+}
+LRESULT drawList(NMLVCUSTOMDRAW* d){
+    if(contrast||systemPaint)return CDRF_DODEFAULT;
+    HWND list=d->nmcd.hdr.hwndFrom;HDC dest=d->nmcd.hdc;
+    if(d->nmcd.dwDrawStage==CDDS_PREPAINT){requestFrame(list);return CDRF_NOTIFYITEMDRAW;}
+    size_t i=d->nmcd.dwItemSpec;
+    if(d->nmcd.dwDrawStage!=CDDS_ITEMPREPAINT||i>=matches.size())return CDRF_DODEFAULT;
+    TileId id{matches[i],rowFlags(list,int(i))};RECT r{};ListView_GetItemRect(list,int(i),&r,LVIR_BOUNDS);
+    for(auto& f:frames){
+        if(!(f->key==requested))continue;
+        auto at=std::find(f->ids.begin(),f->ids.end(),id);if(at==f->ids.end())continue;
+        auto& k=f->key;BITMAPINFO bi{};bi.bmiHeader={sizeof(BITMAPINFOHEADER),k.width,-k.height,1,32,BI_RGB};
+        auto ptr=f->pixels.data()+(at-f->ids.begin())*size_t(k.width)*k.height;
+        SetDIBitsToDevice(dest,0,r.top,k.width,k.height,0,0,0,k.height,ptr,&bi,DIB_RGB_COLORS);return CDRF_SKIPDEFAULT;
+    }
+    FillRect(dest,&r,GetSysColorBrush(COLOR_WINDOW));return CDRF_SKIPDEFAULT;
 }
 void drawNavigation(const DRAWITEMSTRUCT& d){
     if(d.itemID==UINT(-1))return;
@@ -537,6 +581,7 @@ LRESULT CALLBACK wndProc(HWND h,UINT m,WPARAM w,LPARAM l){
     case WM_COMMAND:{
         int id=LOWORD(w),event=HIWORD(w);
         if(id==Tabs && event==LBN_SELCHANGE){viewMode();return 0;}
+        if(id==Page && event==CBN_SELCHANGE){int i=sel(Page),last=int(SendMessageW(ctl(Page),CB_GETCOUNT,0,0))-1;pageIndex=i==last?-1:i;showPage(false);return 0;}
         if(id==Language && event==CBN_SELCHANGE){
             englishUI=sel(Language)==1;
             bool saved=remember(L"Language",englishUI?1:0);
@@ -594,10 +639,11 @@ int WINAPI wWinMain(HINSTANCE inst,HINSTANCE,wchar_t*,int){
     HIGHCONTRASTW hc{sizeof(hc)};SystemParametersInfoW(SPI_GETHIGHCONTRAST,sizeof(hc),&hc,0);contrast=(hc.dwFlags&HCF_HIGHCONTRASTON)!=0;
     canvas=contrast?GetSysColorBrush(COLOR_BTNFACE):CreateSolidBrush(background);wc.hbrBackground=canvas;
     SHSTOCKICONINFO icon{sizeof(icon)};if(SUCCEEDED(SHGetStockIconInfo(SIID_FOLDEROPEN,SHGSI_ICON|SHGSI_LARGEICON,&icon)))wc.hIcon=icon.hIcon;RegisterClassW(&wc);
-    std::thread dbThread(dbLoop);
+    tableWork.start();paintWork.start();std::thread dbThread(dbLoop);
     HWND h=CreateWindowExW(0,wc.lpszClassName,tr(Text::Title),WS_OVERLAPPEDWINDOW|WS_CLIPCHILDREN,CW_USEDEFAULT,CW_USEDEFAULT,px(1050),px(655),nullptr,nullptr,inst,nullptr);
     if(h){ShowWindow(h,SW_SHOW);UpdateWindow(h);MSG msg{};while(GetMessageW(&msg,nullptr,0,0)>0){if(!IsDialogMessageW(h,&msg)){TranslateMessage(&msg);DispatchMessageW(&msg);}}}
     {std::lock_guard lock(queueMutex);shuttingDown=true;}queueReady.notify_one();dbThread.join();
+    tableWork.stop();paintWork.stop();
     // Other workers may still be waiting on a filesystem or an unresponsive shell namespace.
     ExitProcess(h?0:1);
 }
