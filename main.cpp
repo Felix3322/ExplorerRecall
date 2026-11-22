@@ -28,7 +28,7 @@ HBRUSH canvas=nullptr;HIMAGELIST heights=nullptr;bool contrast=false;
 HWND mainWin;HFONT font,titleFont;bool reading=false,readingHistory=false,restoring=false,valid=false,everRead=false,initDb=false,writing=false;
 bool pendingSave=false;unsigned probeGeneration=0;Str pendingName; Open live;Library library;
 std::vector<Row> visits,sessionRows,liveRows;std::vector<size_t> matches;
-ULONGLONG readAt=0;Str notice,liveError,dbError,historyError;
+Str notice,liveError,dbError,historyError;
 std::mutex queueMutex;std::condition_variable queueReady;std::deque<std::function<void()>> dbQueue;
 bool shuttingDown=false;std::atomic<int> dbTasks{0};
 HWND ctl(int id){return GetDlgItem(mainWin,id);}
@@ -194,7 +194,7 @@ void persist(Open state,Str name,bool manual){
 }
 void accept(Open state){
     bool changed=!valid||live.paths.size()!=state.paths.size()||live.paths!=state.paths||live.partial!=state.partial;
-    everRead=valid=true;liveError.clear();live=std::move(state);readAt=GetTickCount64();
+    everRead=valid=true;liveError.clear();live=std::move(state);
     if(changed){
         liveRows.clear();for(auto& p:live.paths)liveRows.push_back({p,0});
         if(initDb && Button_GetCheck(ctl(Auto))==BST_CHECKED && !live.paths.empty())persist(live,tr(Text::AutoTitle),false);
@@ -589,7 +589,7 @@ int WINAPI wWinMain(HINSTANCE inst,HINSTANCE,wchar_t*,int){
     englishUI=language<2?language==1:PRIMARYLANGID(GetUserDefaultUILanguage())!=LANG_CHINESE;
     for(int i=0;i<4;++i){DWORD value=preference((L"Sort"+std::to_wstring(i)).c_str(),99);
         if(value<8)orders[i]={int(value/2),bool(value%2)};}
-    SetProcessDPIAware();INITCOMMONCONTROLSEX common{sizeof(common),ICC_LISTVIEW_CLASSES|ICC_TAB_CLASSES|ICC_STANDARD_CLASSES};InitCommonControlsEx(&common);
+    SetProcessDPIAware();INITCOMMONCONTROLSEX common{sizeof(common),ICC_LISTVIEW_CLASSES|ICC_STANDARD_CLASSES};InitCommonControlsEx(&common);
     WNDCLASSW wc{};wc.hInstance=inst;wc.lpszClassName=L"ExplorerSessionsNative";wc.lpfnWndProc=wndProc;wc.hCursor=LoadCursorW(nullptr,IDC_ARROW);
     HIGHCONTRASTW hc{sizeof(hc)};SystemParametersInfoW(SPI_GETHIGHCONTRAST,sizeof(hc),&hc,0);contrast=(hc.dwFlags&HCF_HIGHCONTRASTON)!=0;
     canvas=contrast?GetSysColorBrush(COLOR_BTNFACE):CreateSolidBrush(background);wc.hbrBackground=canvas;

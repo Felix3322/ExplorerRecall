@@ -37,7 +37,7 @@ static bool readTabs(HWND frame,int hosts,Paths& paths){
     return n>0 && ok==n && n>=hosts;
 }
 static Open collect(){
-    Open out;std::map<HWND,int> frames;EnumWindows(collectFrames,reinterpret_cast<LPARAM>(&frames));out.windows=int(frames.size());
+    Open out;std::map<HWND,int> frames;EnumWindows(collectFrames,reinterpret_cast<LPARAM>(&frames));
     ComPtr<IShellWindows> windows;
     if(FAILED(CoCreateInstance(CLSID_ShellWindows,nullptr,CLSCTX_ALL,IID_PPV_ARGS(&windows))))throw std::runtime_error("shell");
     long n=0;if(FAILED(windows->get_Count(&n)))throw std::runtime_error("shell count");
@@ -60,7 +60,7 @@ static Open collect(){
 // Only this read-only probe subprocess may be terminated on timeout.
 // Its one inherited handle is an anonymous mapping owned by the parent.
 constexpr DWORD mapBytes=4*1024*1024, signature=0x53455332;
-struct Header {DWORD magic,windows,partial,chars;};
+struct Header {DWORD magic,partial,chars;};
 struct View {void* p;~View(){if(p)UnmapViewOfFile(p);}};
 int probeChild(HANDLE mapping){
     if(FAILED(CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED)))return 2;
@@ -73,7 +73,7 @@ int probeChild(HANDLE mapping){
             if(total+path.size()+1>(mapBytes-sizeof(Header))/2)throw std::runtime_error("size");
             std::copy(path.begin(),path.end(),data+total);total+=path.size();data[total++]=0;
         }
-        *h={signature,DWORD(state.windows),DWORD(state.partial),DWORD(total)};code=0;
+        *h={signature,DWORD(state.partial),DWORD(total)};code=0;
     }catch(...){}
     CoUninitialize();return code;
 }
@@ -94,7 +94,7 @@ Open probe(){
     DWORD ec=1;GetExitCodeProcess(proc.h,&ec);if(ec)throw std::runtime_error("Explorer read");
     View v{MapViewOfFile(mapping.h,FILE_MAP_READ,0,0,mapBytes)};if(!v.p)throw std::runtime_error("map");
     auto h=static_cast<Header*>(v.p);if(h->magic!=signature||h->chars>(mapBytes-sizeof(Header))/2)throw std::runtime_error("response");
-    Open out;out.windows=h->windows;out.partial=h->partial!=0;auto data=reinterpret_cast<wchar_t*>(h+1);
+    Open out;out.partial=h->partial!=0;auto data=reinterpret_cast<wchar_t*>(h+1);
     for(size_t i=0;i<h->chars;){size_t len=wcsnlen_s(data+i,h->chars-i);if(len==h->chars-i)throw std::runtime_error("response");out.paths.emplace(data+i,len);i+=len+1;}
     return out;
 }

@@ -16,7 +16,7 @@ struct CaseLess { bool operator()(const Str& a,const Str& b) const {
     return CompareStringOrdinal(a.c_str(),-1,b.c_str(),-1,TRUE)==CSTR_LESS_THAN;
 } };
 using Paths=std::set<Str,CaseLess>;
-struct Open { Paths paths; int windows=0; bool partial=false; };
+struct Open { Paths paths; bool partial=false; };
 struct Row { Str path; Stamp time=0; };
 struct Snap { long long id=0; Str title; Stamp time=0; bool manual=false,partial=false; std::vector<Str> paths; };
 struct Library { std::vector<Snap> snaps; bool record=true; };
